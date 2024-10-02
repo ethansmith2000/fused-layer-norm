@@ -3,11 +3,13 @@ from torch.autograd import Function
 import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import triton
+import torch.nn.functional as F
 
 class LayerNormLinearFunction(Function):
 
     @staticmethod
-    def forward(ctx, input, scale, shift, normalized_shape, weight, bias, eps=1e-5):
+    def forward(ctx, x, scale, shift, weight, bias, eps):
         """
         Performs the forward pass of layer normalization.
 
@@ -24,33 +26,24 @@ class LayerNormLinearFunction(Function):
         """
 
         # layer norm #
-        ctx.normalized_shape = normalized_shape
-        ctx.eps = eps
-
-        orig_shape = input.shape
-        input = input.view(-1, input.shape[-1])
-
-        if isinstance(normalized_shape, int):
-            normalized_shape = (normalized_shape,)
-
-        dims = tuple(-i for i in range(1, len(normalized_shape)+1))
-        mean = input.mean(dim=dims, keepdim=True)
-        var = input.var(dim=dims, unbiased=False, keepdim=True)
-        rstd = torch.rsqrt(var + eps)
-
-        x_norm = (input - mean) * rstd
+        ctx.orig_shape = x.shape
+        x = x.view(-1, x.shape[-1])
+        mean = x.mean(dim=-1)
+        rstd = torch.rsqrt(x.var(dim=-1, unbiased=False) + eps)
+        x_norm = (x - mean.unsqueeze(-1)) * rstd.unsqueeze(-1)
         y = x_norm * scale + shift
 
         # linear #
         ctx.save_for_backward(y, mean, rstd, scale, shift, weight, bias)
-        output = torch.nn.functional.linear(y, weight, bias)
+        output = F.linear(y, weight, bias)
 
-        output = output.view(*orig_shape[:-1], -1)
+        output = output.view(*ctx.orig_shape[:-1], -1)
+
         return output
 
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, do):
         """
         Performs the backward pass of layer normalization.
 
@@ -64,45 +57,43 @@ class LayerNormLinearFunction(Function):
         """
         y, mean, rstd, scale, shift, weight, bias = ctx.saved_tensors
 
-        orig_shape = grad_output.shape
+        orig_shape = do.shape
+        do = do.view(-1, do.shape[-1])
 
         # Gradients w.r.t. Linear layer parameters
-        grad_output_reshaped = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
-        # this is the one that progresses back to layer norm layer
-        grad_input_linear = torch.nn.functional.linear(grad_output_reshaped, weight.t())
-        grad_weight = grad_bias = grad_scale = grad_shift = None
+        dy = F.linear(do, weight.t())
+        dw = db = d_scale = d_shift = None
         if ctx.needs_input_grad[-3]:
-            grad_weight = torch.nn.functional.linear(grad_output_reshaped.t(), y.t())
+            dw = F.linear(do.transpose(-1,-2), y.transpose(-1,-2))
         if ctx.needs_input_grad[-2] and bias is not None:
-            grad_bias = grad_output_reshaped.sum(dim=0)
+            db = do.sum(dim=0)
 
         # recompute 
         x_norm = (y - shift) / scale
 
         if scale is not None:
-            weighted_grad_input_linear = grad_input_linear * scale
+            weighted_dy = dy * scale
         else:
-            weighted_grad_input_linear = grad_input_linear
+            weighted_dy = dy
 
-        grad_input = (1.0 / x_norm.shape[-1]) * rstd * (
-            x_norm.shape[-1] * weighted_grad_input_linear
-            - weighted_grad_input_linear.sum(dim=-1, keepdim=True)
-            - x_norm * (weighted_grad_input_linear * x_norm).sum(dim=-1, keepdim=True)
+        dx = (1.0 / x_norm.shape[-1]) * rstd.unsqueeze(-1) * (
+            x_norm.shape[-1] * weighted_dy
+            - weighted_dy.sum(dim=-1, keepdim=True)
+            - x_norm * (weighted_dy * x_norm).sum(dim=-1, keepdim=True)
         )
 
         if weight is not None and ctx.needs_input_grad[1]:
-            grad_scale = (grad_input_linear * x_norm).sum(0)
+            d_scale = (dy * x_norm).sum(0)
         if bias is not None and ctx.needs_input_grad[2]:
-            grad_shift = grad_input_linear.sum(0)
+            d_shift = dy.sum(0)
 
-        grad_input = grad_input.view(*orig_shape[:-1], -1)
+        dx = dx.view(*orig_shape[:-1], -1)
 
-        # Return gradients for input, weight, bias, and None for normalized_shape and eps
-        return grad_input, grad_scale, grad_shift, None, grad_weight, grad_bias, None
+        return dx, d_scale, d_shift, dw, db, None
 
 
 # Unit Test
-def test_layer_norm_function():
+def test_ln_linear_function():
     torch.manual_seed(42)
 
     # Create random input
@@ -120,7 +111,7 @@ def test_layer_norm_function():
     # Using custom LayerNormFunction
     input_c = input.clone().detach().requires_grad_(True)
 
-    output_custom = LayerNormLinearFunction.apply(input_c, layer_norm.weight, layer_norm.bias, normalized_shape, linear.weight, linear.bias, layer_norm.eps)
+    output_custom = LayerNormLinearFunction.apply(input_c, layer_norm.weight, layer_norm.bias, linear.weight, linear.bias, layer_norm.eps)
     loss_custom = output_custom.sum()
     loss_custom.backward()
 
@@ -161,52 +152,48 @@ def test_layer_norm_function():
     print(torch.allclose(grad_bias_custom, grad_bias_builtin, atol=1e-6, rtol=1e-4))
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['N'],
+        x_vals=[512 * i for i in range(2, 32)],
+        line_arg='provider',
+        line_vals=['custom', 'torch'],
+        line_names=['custom', 'Torch'],
+        styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
+        ylabel='GB/s',
+        plot_name='linear-backward',
+        args={'M': 32, 'dtype': torch.float16, 'mode': 'backward'},
+    ))
+def bench_ln_linear(M, N, dtype, provider, mode='forward', eps=1e-5, device='cuda', rep=100):
+    # create data
+    x_shape = (M, N)
+    linear = torch.nn.Linear(N, N).to(device).to(dtype)
+    norm = torch.nn.LayerNorm(N, eps=eps).to(device).to(dtype)
+    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
+    dy = .1 * torch.randn_like(x)
+    x.requires_grad_(True)
+    quantiles = [0.5, 0.2, 0.8]
 
-def benchmark_layer_norm_linear(
-    batches=(128,), 
-    dims=([i*512 for i in range(2, 16)]),
-):
+    def y_fwd():
+        if provider == "custom":
+            return LayerNormLinearFunction.apply(x, norm.weight, norm.bias, linear.weight, linear.bias, eps)
 
-    times_torch = []
-    times_custom = []
-    pbar = tqdm(total=len(batches)*len(dims))
-    for batch in batches:
-        for dim in dims:
-            torch.manual_seed(42)
+        if provider == "torch":
+            return linear(norm(x))
 
-            # Create random input
-            input = torch.randn(batch, dim, requires_grad=True)
-            layer_norm = torch.nn.LayerNorm(dim, eps=1e-5)
-            linear = torch.nn.Linear(dim, dim)
+    # forward pass
+    if mode == 'forward':
+        gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=rep)
 
-            # torch
-            start = time.time()
-            input_b = input.clone().detach().requires_grad_(True)
-            out_norm = layer_norm(input_b)
-            output_builtin = linear(out_norm)
-            loss_builtin = output_builtin.sum()
-            loss_builtin.backward()
-            end = time.time()
-            times_torch.append(end-start)
-
-            # custom
-            start = time.time()
-            input_c = input.clone().detach().requires_grad_(True)
-            output_custom = LayerNormLinearFunction.apply(input_c, layer_norm.weight, layer_norm.bias, dim, linear.weight, linear.bias, layer_norm.eps)
-            loss_custom = output_custom.sum()
-            loss_custom.backward()
-            end = time.time()
-            times_custom.append(end-start)
-            pbar.update(1)
-
-    
-    plt.figure(figsize=(10, 5))
-    plt.plot(times_torch, label='torch')
-    plt.plot(times_custom, label='custom')
-    plt.xlabel('dim')
-    plt.ylabel('Time (s)')
-    plt.legend()
+    # backward pass
+    if mode == 'backward':
+        y = y_fwd()
+        gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)  # noqa: F811, E704
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True), quantiles=quantiles,
+                                                     grad_to_none=[x], rep=rep)
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
     
 if __name__ == "__main__":
-  test_layer_norm_function()
-  benchmark_layer_norm_linear()
+  test_ln_linear_function()
+  bench_ln_linear.run(save_path='.', print_data=True)
